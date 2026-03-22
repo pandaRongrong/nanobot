@@ -103,6 +103,7 @@ class GatewayConfig(Base):
     host: str = "0.0.0.0"
     port: int = 18790
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
+    use_agent_sdk: bool = False  # Use Claude Agent SDK instead of LiteLLM
 
 
 class WebSearchConfig(Base):

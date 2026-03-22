@@ -418,30 +418,55 @@ def gateway(
     console.print(f"{__logo__} Starting nanobot gateway on port {port}...")
     sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
-    provider = _make_provider(config)
     session_manager = SessionManager(config.workspace_path)
 
     # Create cron service first (callback set after agent creation)
     cron_store_path = get_cron_dir() / "jobs.json"
     cron = CronService(cron_store_path)
 
-    # Create agent with cron service
-    agent = AgentLoop(
-        bus=bus,
-        provider=provider,
-        workspace=config.workspace_path,
-        model=config.agents.defaults.model,
-        max_iterations=config.agents.defaults.max_tool_iterations,
-        context_window_tokens=config.agents.defaults.context_window_tokens,
-        web_search_config=config.tools.web.search,
-        web_proxy=config.tools.web.proxy or None,
-        exec_config=config.tools.exec,
-        cron_service=cron,
-        restrict_to_workspace=config.tools.restrict_to_workspace,
-        session_manager=session_manager,
-        mcp_servers=config.tools.mcp_servers,
-        channels_config=config.channels,
-    )
+    # Create agent with cron service - use Agent SDK if configured
+    if config.gateway.use_agent_sdk:
+        from nanobot.agent.agent_sdk import AgentSDKLoop
+
+        # Get API key from config or environment
+        provider_config = config.get_provider(config.agents.defaults.model)
+        api_key = provider_config.api_key if provider_config else None
+
+        agent = AgentSDKLoop(
+            bus=bus,
+            workspace=config.workspace_path,
+            model=config.agents.defaults.model,
+            max_turns=config.agents.defaults.max_tool_iterations,
+            context_window_tokens=config.agents.defaults.context_window_tokens,
+            web_search_config=config.tools.web.search,
+            web_proxy=config.tools.web.proxy or None,
+            exec_config=config.tools.exec,
+            cron_service=cron,
+            restrict_to_workspace=config.tools.restrict_to_workspace,
+            session_manager=session_manager,
+            mcp_servers=config.tools.mcp_servers,
+            channels_config=config.channels,
+            api_key=api_key,
+        )
+    else:
+        provider = _make_provider(config)
+        from nanobot.agent.loop import AgentLoop
+        agent = AgentLoop(
+            bus=bus,
+            provider=provider,
+            workspace=config.workspace_path,
+            model=config.agents.defaults.model,
+            max_iterations=config.agents.defaults.max_tool_iterations,
+            context_window_tokens=config.agents.defaults.context_window_tokens,
+            web_search_config=config.tools.web.search,
+            web_proxy=config.tools.web.proxy or None,
+            exec_config=config.tools.exec,
+            cron_service=cron,
+            restrict_to_workspace=config.tools.restrict_to_workspace,
+            session_manager=session_manager,
+            mcp_servers=config.tools.mcp_servers,
+            channels_config=config.channels,
+        )
 
     # Set cron callback (needs agent)
     async def on_cron_job(job: CronJob) -> str | None:
@@ -456,7 +481,16 @@ def gateway(
             f"Scheduled instruction: {job.payload.message}"
         )
 
-        cron_tool = agent.tools.get("cron")
+        # Get tools - works with both AgentLoop and AgentSDKLoop
+        cron_tool = None
+        message_tool = None
+        if hasattr(agent, 'tools'):
+            cron_tool = agent.tools.get("cron")
+            message_tool = agent.tools.get("message")
+        elif hasattr(agent, '_nanobot_tools'):
+            cron_tool = agent._nanobot_tools.get("cron")
+            message_tool = agent._nanobot_tools.get("message")
+
         cron_token = None
         if isinstance(cron_tool, CronTool):
             cron_token = cron_tool.set_cron_context(True)
@@ -471,21 +505,29 @@ def gateway(
             if isinstance(cron_tool, CronTool) and cron_token is not None:
                 cron_tool.reset_cron_context(cron_token)
 
-        message_tool = agent.tools.get("message")
         if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
             return response
 
         if job.payload.deliver and job.payload.to and response:
-            should_notify = await evaluate_response(
-                response, job.payload.message, provider, agent.model,
-            )
-            if should_notify:
+            # Skip evaluation in Agent SDK mode (no provider)
+            if config.gateway.use_agent_sdk:
                 from nanobot.bus.events import OutboundMessage
                 await bus.publish_outbound(OutboundMessage(
                     channel=job.payload.channel or "cli",
                     chat_id=job.payload.to,
                     content=response,
                 ))
+            else:
+                should_notify = await evaluate_response(
+                    response, job.payload.message, provider, agent.model,
+                )
+                if should_notify:
+                    from nanobot.bus.events import OutboundMessage
+                    await bus.publish_outbound(OutboundMessage(
+                        channel=job.payload.channel or "cli",
+                        chat_id=job.payload.to,
+                        content=response,
+                    ))
         return response
     cron.on_job = on_cron_job
 
@@ -532,10 +574,13 @@ def gateway(
             return  # No external channel available to deliver to
         await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
 
+    # Set provider for heartbeat (None in Agent SDK mode)
+    _provider = provider if not config.gateway.use_agent_sdk else None
+
     hb_cfg = config.gateway.heartbeat
     heartbeat = HeartbeatService(
         workspace=config.workspace_path,
-        provider=provider,
+        provider=_provider,
         model=agent.model,
         on_execute=on_heartbeat_execute,
         on_notify=on_heartbeat_notify,
